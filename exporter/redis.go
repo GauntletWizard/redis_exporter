@@ -33,8 +33,8 @@ type Exporter struct {
 	keys         []dbKeyPair
 	keyValues    *prometheus.GaugeVec
 	keySizes     *prometheus.GaugeVec
-	duration     prometheus.Gauge
-	scrapeErrors prometheus.Gauge
+	duration     prometheus.Histogram
+	scrapeErrors prometheus.Counter
 	totalScrapes prometheus.Counter
 	metrics      map[string]*prometheus.GaugeVec
 	metricsMtx   sync.RWMutex
@@ -199,7 +199,7 @@ func NewRedisExporter(host RedisHost, namespace, checkKeys string) (*Exporter, e
 			Name:      "key_size",
 			Help:      "The length or size of \"key\"",
 		}, []string{"addr", "alias", "db", "key"}),
-		duration: prometheus.NewGauge(prometheus.GaugeOpts{
+		duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "exporter_last_scrape_duration_seconds",
 			Help:      "The last scrape duration.",
@@ -209,7 +209,7 @@ func NewRedisExporter(host RedisHost, namespace, checkKeys string) (*Exporter, e
 			Name:      "exporter_scrapes_total",
 			Help:      "Current total redis scrapes.",
 		}),
-		scrapeErrors: prometheus.NewGauge(prometheus.GaugeOpts{
+		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exporter_last_scrape_error",
 			Help:      "The last scrape error status.",
@@ -268,8 +268,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.keyValues.Reset()
 
 	e.initGauges()
-	go e.scrape(scrapes)
-	e.setMetrics(scrapes)
+	now := time.Now()
+	e.scrape(scrapes)
+	e.setMetrics(scrapes, now)
 
 	e.keySizes.Collect(ch)
 	e.keyValues.Collect(ch)
@@ -709,26 +710,34 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 }
 
 func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
-	defer close(scrapes)
 
-	now := time.Now().UnixNano()
 	e.totalScrapes.Inc()
+	wg := sync.WaitGroup{}
 
-	errorCount := 0
 	for idx, addr := range e.redis.Addrs {
-		var up float64 = 1
-		if err := e.scrapeRedisHost(scrapes, addr, idx); err != nil {
-			errorCount++
-			up = 0
-		}
-		scrapes <- scrapeResult{Name: "up", Addr: addr, Alias: e.redis.Aliases[idx], Value: up}
+		wg.Add(1)
+		log.Println(wg)
+		go func() {
+			var up float64 = 1
+			if err := e.scrapeRedisHost(scrapes, addr, idx); err != nil {
+				e.scrapeErrors.Add(1)
+				up = 0
+			}
+			scrapes <- scrapeResult{Name: "up", Addr: addr, Alias: e.redis.Aliases[idx], Value: up}
+			wg.Done()
+			log.Println(wg)
+		}()
+		log.Println(wg)
 	}
-
-	e.scrapeErrors.Set(float64(errorCount))
-	e.duration.Set(float64(time.Now().UnixNano()-now) / 1000000000)
+	// Close the scrapes channel after we're done with all scrapes.
+	go func() {
+		wg.Wait()
+		close(scrapes)
+	}()
+	return
 }
 
-func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
+func (e *Exporter) setMetrics(scrapes <-chan scrapeResult, start time.Time) {
 	for scr := range scrapes {
 		name := scr.Name
 		if _, ok := e.metrics[name]; !ok {
@@ -745,6 +754,7 @@ func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
 		}
 		e.metrics[name].With(labels).Set(float64(scr.Value))
 	}
+	e.duration.Observe((time.Now().Sub(start)).Seconds())
 }
 
 func (e *Exporter) collectMetrics(metrics chan<- prometheus.Metric) {
